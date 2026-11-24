@@ -11,18 +11,17 @@ import traceback
 from datetime import datetime
 from email.header import decode_header
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from ddgs import DDGS
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 
 # 1. Setup Flask App
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))
+# Fixed fallback secret key so login sessions survive across Vercel serverless invocations
+app.secret_key = os.getenv("SECRET_KEY", "artic-ai-vercel-secret-key-2026")
 
-# 2. Load Credentials
+# 2. Load Credentials (local .env locally; Vercel dashboard Environment Variables in production)
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-load_dotenv(dotenv_path=env_path)
+if os.path.exists(env_path):
+    load_dotenv(dotenv_path=env_path)
 
 AGENT_NAME = "Artic"
 api_key = os.getenv("GEMINI_API_KEY")
@@ -33,17 +32,22 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "artic123")
 
-if not api_key:
-    raise ValueError("GEMINI_API_KEY not found! Please check your environment variables.")
+# Safe client initialization so missing/delayed env vars never crash the login page on boot
+client = None
+if api_key:
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key, http_options={'timeout': 35000})
+    except Exception as e:
+        print(f"Gemini client init warning: {e}")
 
-client = genai.Client(
-    api_key=api_key,
-    http_options={'timeout': 35000}
-)
-
-# 3. Setup Local Fallback Folders
-NOTES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes")
-os.makedirs(NOTES_DIR, exist_ok=True)
+# 3. Setup Writable Fallback Folders (/tmp is the only writable directory on Vercel)
+BASE_TMP = "/tmp" if os.path.exists("/tmp") else os.path.dirname(os.path.abspath(__file__))
+NOTES_DIR = os.path.join(BASE_TMP, "notes")
+try:
+    os.makedirs(NOTES_DIR, exist_ok=True)
+except Exception:
+    pass
 MEMORY_FILE = os.path.join(NOTES_DIR, "memory.txt")
 
 # --- SUPABASE REST HELPER ---
@@ -104,6 +108,7 @@ def get_weather(city: str) -> str:
 
 def search_web(query: str) -> str:
     try:
+        from ddgs import DDGS
         results = DDGS().text(query, max_results=4)
         return str(results) if results else "No results found."
     except Exception as e:
@@ -214,7 +219,7 @@ def save_note(filename: str, content: str) -> str:
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(clean_content)
-        return f"Saved '{clean_name}' to local notes (Supabase keys not set)."
+        return f"Saved '{clean_name}' to temporary notes (Supabase keys not set)."
     except Exception as e:
         return f"Error saving note: {e}"
 
@@ -294,36 +299,37 @@ def load_long_term_memory() -> str:
             return f.read().strip()
     return ""
 
-long_term_memory = load_long_term_memory()
-
-my_agent_rules = (
-    f"Your name is {AGENT_NAME}. You are Amarendra's personal cloud AI assistant with live internet, Gmail, cloud notes, and a math calculator. "
-    "Keep responses conversational, sharp, and well-formatted. "
-    "Always use calculate_math for any arithmetic or equations. "
-    "MANDATORY TOOL RULES: "
-    "1. Whenever the user asks you to 'remember', 'note down', or 'keep in mind' any fact or preference, you MUST immediately call the `remember_fact` tool—never just say 'Got it' without calling the tool first. "
-    "2. Whenever the user asks you to save, read, or list notes, you MUST call `save_note`, `read_note`, or `list_notes`. "
-    "3. If any tool returns an error message, report the exact error to the user so it can be fixed. "
-    "4. If asked for a 'briefing', 'update', or 'status', autonomously: check time, check live weather for Hyderabad, and check latest unread emails, then summarize naturally."
-)
-if long_term_memory:
-    my_agent_rules += f"\nLong-term memory facts:\n{long_term_memory}"
+def get_system_prompt() -> str:
+    long_term_memory = load_long_term_memory()
+    rules = (
+        f"Your name is {AGENT_NAME}. You are Amarendra's personal cloud AI assistant with live internet, Gmail, cloud notes, and a math calculator. "
+        "Keep responses conversational, sharp, and well-formatted. "
+        "Always use calculate_math for any arithmetic or equations. "
+        "MANDATORY TOOL RULES: "
+        "1. Whenever the user asks you to 'remember', 'note down', or 'keep in mind' any fact or preference, you MUST immediately call the `remember_fact` tool—never just say 'Got it' without calling the tool first. "
+        "2. Whenever the user asks you to save, read, or list notes, you MUST call `save_note`, `read_note`, or `list_notes`. "
+        "3. If any tool returns an error message, report the exact error to the user so it can be fixed. "
+        "4. If asked for a 'briefing', 'update', or 'status', autonomously: check time, check live weather for Hyderabad, and check latest unread emails, then summarize naturally."
+    )
+    if long_term_memory:
+        rules += f"\nLong-term memory facts:\n{long_term_memory}"
+    return rules
 
 AGENT_TOOLS = [calculate_math, get_weather, search_web, send_email, check_emails, save_note, read_note, list_notes, get_current_time, remember_fact]
-MODELS = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash-lite']
+MODELS = ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-pro']
 active_model_index = 0
+chat_session = None
 
 def build_chat_session(model_name: str, history=None):
+    from google.genai import types
     return client.chats.create(
         model=model_name,
         history=history,
         config=types.GenerateContentConfig(
-            system_instruction=my_agent_rules,
+            system_instruction=get_system_prompt(),
             tools=AGENT_TOOLS
         )
     )
-
-chat_session = build_chat_session(MODELS[active_model_index])
 
 # 5. Web Routes & Authentication
 @app.route('/login', methods=['GET', 'POST'])
@@ -353,10 +359,16 @@ def chat():
     if not session.get('authenticated'):
         return jsonify({"reply": "🔒 Session expired. Please refresh and log in again."}), 401
 
-    user_input = request.json.get("message")
+    if not client:
+        return jsonify({"reply": "⚠️ GEMINI_API_KEY is missing in Vercel Environment Variables."}), 500
+
+    user_input = (request.json or {}).get("message")
     if not user_input:
         return jsonify({"reply": "I didn't catch that."})
-    
+
+    if chat_session is None:
+        chat_session = build_chat_session(MODELS[active_model_index])
+
     errors = []
     for offset in range(len(MODELS)):
         idx = (active_model_index + offset) % len(MODELS)
@@ -376,7 +388,7 @@ def chat():
 
     return jsonify({"reply": "All models failed:\n" + "\n".join(errors)})
 
-# 6. Run the Server
+# 6. Run the Server (Local Dev Only; Vercel uses the `app` WSGI object directly)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
